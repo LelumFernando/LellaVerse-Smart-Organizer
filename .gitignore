@@ -1,6 +1,24 @@
+# Build artifacts and distributions
 build/
 dist/
-*.spec
+Output/
+*.tmp
+*.log
+
+# Bytecode and caches
 __pycache__/
 *.pyc
-*.tmp
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv_build/
+venv/
+.venv/
+env/
+
+# IDE and OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

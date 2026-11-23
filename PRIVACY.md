@@ -11,6 +11,6 @@
 - If you enable "Start with Windows", the app adds a start-up entry for your user only.
   You can switch it off in the app's Settings tab.
 
-Questions? Open an issue on the project's GitHub page.
+Questions? Open an issue on the project's GitHub page: https://github.com/LelumFernando/LellaVerse-Smart-Organizer/issues
 
 App by Lelum Anuradha Fernando (LellaVerse).
