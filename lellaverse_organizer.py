@@ -27,9 +27,11 @@ import sys
 # ----------------------------------------------------------------------------
 if getattr(sys, "frozen", False):
     exe_dir = os.path.dirname(os.path.abspath(sys.executable))
-    local_app_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "LellaVerseOrganizer", "tcl_runtime")
-    tcl_dest = os.path.join(local_app_dir, "tcl8.6")
-    tk_dest = os.path.join(local_app_dir, "tk8.6")
+    local_app_data = os.environ.get("LOCALAPPDATA", os.path.join(os.path.expanduser("~"), "AppData", "Local"))
+    local_app_dir = os.path.join(local_app_data, "LellaVerseSmartOrganizer")
+    tcl_runtime_dir = os.path.join(local_app_dir, "tcl_runtime")
+    tcl_dest = os.path.join(tcl_runtime_dir, "tcl8.6")
+    tk_dest = os.path.join(tcl_runtime_dir, "tk8.6")
 
     search_dirs = [
         getattr(sys, "_MEIPASS", exe_dir),
@@ -51,22 +53,21 @@ if getattr(sys, "frozen", False):
         if tcl_src and tk_src:
             break
 
-    # If the app is run from a OneDrive folder or path with spaces/reparse points,
-    # Windows Kernel32 GetShortPathNameW bug corrupts the path inside Tcl's C runtime.
-    # Staging to %LOCALAPPDATA% ensures 100% crash-free launch anywhere.
-    needs_staging = "onedrive" in exe_dir.lower() or not os.path.exists(os.path.join(tcl_dest, "init.tcl"))
+    # Direct source works without copying in normal installations (0ms delay)
+    # Staging to %LOCALAPPDATA% is only needed if running from OneDrive reparse points
+    needs_staging = "onedrive" in exe_dir.lower()
 
     if needs_staging and tcl_src and tk_src:
         try:
             import shutil
-            os.makedirs(local_app_dir, exist_ok=True)
+            os.makedirs(tcl_runtime_dir, exist_ok=True)
             if not os.path.exists(os.path.join(tcl_dest, "init.tcl")):
                 shutil.copytree(tcl_src, tcl_dest, dirs_exist_ok=True)
             if not os.path.exists(os.path.join(tk_dest, "tk.tcl")):
                 shutil.copytree(tk_src, tk_dest, dirs_exist_ok=True)
             tcl8_src = os.path.join(os.path.dirname(tcl_src), "tcl8")
-            if os.path.exists(tcl8_src) and not os.path.exists(os.path.join(local_app_dir, "tcl8")):
-                shutil.copytree(tcl8_src, os.path.join(local_app_dir, "tcl8"), dirs_exist_ok=True)
+            if os.path.exists(tcl8_src) and not os.path.exists(os.path.join(tcl_runtime_dir, "tcl8")):
+                shutil.copytree(tcl8_src, os.path.join(tcl_runtime_dir, "tcl8"), dirs_exist_ok=True)
             os.environ["TCL_LIBRARY"] = tcl_dest
             os.environ["TK_LIBRARY"] = tk_dest
         except Exception:
@@ -137,8 +138,33 @@ APP_VERSION = "2.0.0"
 AUTHOR = "Lelum Anuradha Fernando"
 GITHUB_URL = "https://github.com/LelumFernando/LellaVerse-Smart-Organizer"
 HOME = os.path.expanduser("~")
-CONFIG_FILE = os.path.join(HOME, "LellaVerse_Organizer_config.json")
-HISTORY_FILE = os.path.join(HOME, "LellaVerse_Organizer_history.json")
+
+# Runtime Data Stored Exclusively under %LOCALAPPDATA%\LellaVerseSmartOrganizer
+# Guarantees standard users have write permissions in Program Files installation
+LOCAL_APP_DATA = os.environ.get("LOCALAPPDATA", os.path.join(HOME, "AppData", "Local"))
+APP_DATA_DIR = os.path.join(LOCAL_APP_DATA, "LellaVerseSmartOrganizer")
+os.makedirs(APP_DATA_DIR, exist_ok=True)
+
+CONFIG_FILE = os.path.join(APP_DATA_DIR, "config.json")
+HISTORY_FILE = os.path.join(APP_DATA_DIR, "history.json")
+LOG_FILE = os.path.join(APP_DATA_DIR, "app.log")
+LOCK_FILE = os.path.join(APP_DATA_DIR, "app.lock")
+
+# Auto-migrate legacy user home config/history files if present
+_legacy_cfg = os.path.join(HOME, "LellaVerse_Organizer_config.json")
+if os.path.exists(_legacy_cfg) and not os.path.exists(CONFIG_FILE):
+    try:
+        shutil.copy2(_legacy_cfg, CONFIG_FILE)
+    except Exception:
+        pass
+
+_legacy_hist = os.path.join(HOME, "LellaVerse_Organizer_history.json")
+if os.path.exists(_legacy_hist) and not os.path.exists(HISTORY_FILE):
+    try:
+        shutil.copy2(_legacy_hist, HISTORY_FILE)
+    except Exception:
+        pass
+
 LOCK_PORT = 48653
 STARTUP_DELAY_MS = 20000
 HISTORY_LIMIT = 500
@@ -250,6 +276,7 @@ def norm(p):
 
 
 def write_json(path, data):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
@@ -1029,16 +1056,34 @@ def trim_working_set():
 _instance_sock = None
 
 
+_mutex_handle = None
+_lock_fd = None
+
 def acquire_single_instance():
-    global _instance_sock
+    """Acquires a single-instance lock using a Win32 Mutex (with file-locking fallback).
+    Avoids socket-binding issues, firewall popups, and permission restrictions.
+    """
+    global _mutex_handle, _lock_fd
+    if IS_WIN:
+        try:
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+            kernel32.CreateMutexW.restype = wintypes.HANDLE
+            # Session-local named mutex
+            _mutex_handle = kernel32.CreateMutexW(None, True, "Local\\LellaVerseSmartOrganizer_SingleInstanceMutex")
+            if not _mutex_handle or kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+                return False
+            return True
+        except Exception:
+            pass
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("127.0.0.1", LOCK_PORT))
-        s.listen(1)
-        _instance_sock = s
+        import msvcrt
+        _lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR)
+        msvcrt.locking(_lock_fd, msvcrt.LK_NBLCK, 1)
         return True
-    except OSError:
+    except Exception:
         return False
 
 
@@ -1078,11 +1123,19 @@ class Tray:
                 pystray.MenuItem("Quit", cmd("quit")),
             )
             self.icon = pystray.Icon("LellaVerseOrganizer", img, APP_NAME, menu)
-            self.icon.run_detached()
+            # Run pystray strictly in a separate daemon thread to ensure zero main-thread blocking
+            threading.Thread(target=self._run_icon, daemon=True, name="LellaVerseTray").start()
             return True
         except Exception:
             self.icon = None
             return False
+
+    def _run_icon(self):
+        try:
+            if self.icon:
+                self.icon.run()
+        except Exception:
+            pass
 
     def set_title(self, text):
         try:
@@ -1358,13 +1411,11 @@ class OrganizerApp:
         self.build_ui()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
+        self._initial_folder = initial_folder
         self.refresh_folders(select=0)
         self.refresh_history()
         self.set_running_ui(_is_watching)
         self.poll_queue()
-
-        self.root.update_idletasks()
-        trim_working_set()
 
         self.log("Ready. Smart metadata & app origin detector loaded.", "info")
         if CONFIG_LOAD_ERROR:
@@ -1372,15 +1423,21 @@ class OrganizerApp:
         if not (_tray and _tray.running):
             self.log("Tray icon off. To enable: pip install pystray pillow", "info")
 
-        # Handle initial folder from context menu or command line
-        if initial_folder:
-            norm_init = norm(initial_folder)
+        # Defer memory trimming, initial folder setup, and watcher startup post-render
+        self.root.after(200, self._post_render_startup)
+
+    def _post_render_startup(self):
+        trim_working_set()
+        if self._initial_folder:
+            norm_init = norm(self._initial_folder)
             match = next((r for r in cfg["folders"] if norm(r["path"]) == norm_init), None)
             if not match:
-                cfg["folders"].append(new_folder_rule(initial_folder))
+                cfg["folders"].append(new_folder_rule(self._initial_folder))
                 self.save()
                 self.refresh_folders(select=len(cfg["folders"]) - 1)
-            self.root.after(300, lambda: self.sort_now(silent=False))
+            threading.Thread(target=lambda: sort_now(silent=False), daemon=True).start()
+        elif cfg.get("auto_start_watching", False) and not _is_watching:
+            threading.Thread(target=lambda: start_watching(silent=True), daemon=True).start()
 
     def setup_window_icons(self):
         ico_path = os.path.join(ASSETS_DIR, "app_icon.ico")
@@ -1742,8 +1799,9 @@ class OrganizerApp:
         check("close_to_tray", "Closing the window minimizes to system tray (keeps watching)")
         check("start_with_windows", "Start with Windows  (hidden in tray, 20s boot delay, low priority)")
 
-        tray_text = ("Tray icon: Active & running." if self.tray_ok else "Tray icon: Not installed.  Run: pip install pystray pillow")
-        tk.Label(c, text=tray_text, font=FONT_S, bg=CARD, fg=GREEN if self.tray_ok else ORANGE).pack(anchor="w", pady=(10, 0))
+        tray_running = bool(_tray and _tray.running)
+        tray_text = ("Tray icon: Active & running." if tray_running else "Tray icon: Not installed.  Run: pip install pystray pillow")
+        tk.Label(c, text=tray_text, font=FONT_S, bg=CARD, fg=GREEN if tray_running else ORANGE).pack(anchor="w", pady=(10, 0))
 
     def build_about_tab(self):
         c = card(self.tab_about, f"{APP_NAME}", f"Version {APP_VERSION}")
@@ -1825,6 +1883,26 @@ class OrganizerApp:
             fg=RED if s["errors"] or s["infected"] else MUTED)
 
     def poll_queue(self):
+        # 1. Process external commands from tray menu while GUI is open
+        try:
+            while not _gui_cmd_queue.empty():
+                cmd, arg = _gui_cmd_queue.get_nowait()
+                if cmd == "open":
+                    self.show_window()
+                elif cmd == "sort":
+                    threading.Thread(target=lambda: sort_now(silent=True), daemon=True).start()
+                elif cmd == "toggle":
+                    if _is_watching:
+                        stop_watching()
+                    else:
+                        threading.Thread(target=lambda: start_watching(silent=True), daemon=True).start()
+                elif cmd == "quit":
+                    self.quit_app()
+                    return
+        except Exception:
+            pass
+
+        # 2. Process background thread events safely on the main GUI thread
         try:
             while True:
                 item = ui_queue.get_nowait()
@@ -1838,29 +1916,51 @@ class OrganizerApp:
                     self.update_stats()
                 elif kind == "progress":
                     done, total = item[1], item[2]
-                    self.progress.config(maximum=max(total, 1), value=done)
-                    self.progress_label.config(text=f"Organizing {done} / {total}" if total else "")
-                    self.now_btn.set_enabled(False)
-                    self.preview_btn.set_enabled(False)
+                    try:
+                        self.progress.config(maximum=max(total, 1), value=done)
+                        self.progress_label.config(text=f"Organizing {done} / {total}" if total else "")
+                        self.now_btn.set_enabled(False)
+                        self.preview_btn.set_enabled(False)
+                    except (tk.TclError, Exception):
+                        pass
                 elif kind == "done":
-                    self.now_btn.set_enabled(True)
-                    self.preview_btn.set_enabled(True)
-                    self.progress_label.config(text="Done ✔")
+                    try:
+                        self.progress.config(value=0)
+                        self.now_btn.set_enabled(True)
+                        self.preview_btn.set_enabled(True)
+                        self.progress_label.config(text="Done ✔")
+                        self.refresh_history()
+                    except (tk.TclError, Exception):
+                        pass
+                elif kind == "running":
+                    try:
+                        self.set_running_ui(item[1])
+                    except (tk.TclError, Exception):
+                        pass
                 elif kind == "history":
-                    self.refresh_history()
+                    try:
+                        self.refresh_history()
+                    except (tk.TclError, Exception):
+                        pass
                 elif kind == "notify":
-                    if _tray:
+                    if _tray and _tray.running:
                         _tray.notify(item[1], item[2])
                 elif kind == "popup":
                     self.log(f"{item[1]}: {item[2]}", "error")
-                    messagebox.showerror(item[1], item[2], parent=self.root)
+                    try:
+                        messagebox.showerror(item[1], item[2], parent=self.root)
+                    except (tk.TclError, Exception):
+                        pass
         except queue.Empty:
             pass
-        try:
-            if self.root.winfo_exists():
-                self._poll_job = self.root.after(200, self.poll_queue)
         except Exception:
             pass
+        finally:
+            try:
+                if self.root.winfo_exists():
+                    self._poll_job = self.root.after(100, self.poll_queue)
+            except Exception:
+                pass
 
     # ---------- settings ----------
     def save(self):
@@ -2218,36 +2318,39 @@ class OrganizerApp:
 
     # ---------- run ----------
     def start_organizer(self, silent=False):
-        start_watching(silent=silent)
+        threading.Thread(target=lambda: start_watching(silent=silent), daemon=True).start()
 
     def stop_organizer(self):
         stop_watching()
 
     def sort_now(self, silent=False):
-        sort_now(silent=silent)
+        threading.Thread(target=lambda: sort_now(silent=silent), daemon=True).start()
 
     def set_running_ui(self, running):
-        self.start_btn.set_enabled(not running)
-        self.stop_btn.set_enabled(running)
-        if running:
-            self.status_pill.config(text="●  RUNNING", fg=GREEN, bg=GREEN_BG, highlightbackground=GREEN)
-        else:
-            self.status_pill.config(text="●  STOPPED", fg=RED, bg=RED_BG, highlightbackground=RED)
+        try:
+            self.start_btn.set_enabled(not running)
+            self.stop_btn.set_enabled(running)
+            if running:
+                self.status_pill.config(text="●  RUNNING", fg=GREEN, bg=GREEN_BG, highlightbackground=GREEN)
+            else:
+                self.status_pill.config(text="●  STOPPED", fg=RED, bg=RED_BG, highlightbackground=RED)
+        except (tk.TclError, Exception):
+            pass
 
 
 def prepare_folders(silent=False):
     if not cfg["folders"]:
         msg = "Please add at least one folder first (＋ Add folder)."
         log(msg, "warning")
-        if not silent and _active_app:
-            messagebox.showinfo("Cannot start", msg, parent=_active_app.root)
+        if not silent:
+            ui_queue.put(("popup", "Cannot start", msg))
         return False
     bad = [check_watch_path(r["path"])[1] for r in cfg["folders"] if not check_watch_path(r["path"])[0]]
     if bad:
         msg = "\n\n".join(bad)
         log(msg, "error")
-        if not silent and _active_app:
-            messagebox.showerror("Cannot start", msg, parent=_active_app.root)
+        if not silent:
+            ui_queue.put(("popup", "Cannot start", msg))
         return False
     for r in cfg["folders"]:
         try:
@@ -2281,8 +2384,7 @@ def start_watching(silent=False):
         n = len(cfg["folders"])
         if _tray:
             _tray.set_title(f"{APP_NAME} - running ({n} folder{'s' if n != 1 else ''})")
-        if _active_app:
-            _active_app.set_running_ui(True)
+        ui_queue.put(("running", True))
         if cfg["sort_existing"]:
             log("Organizing existing files...", "info")
             organize_existing()
@@ -2291,27 +2393,30 @@ def start_watching(silent=False):
         _observer, _watches = None, {}
         _is_watching = False
         log(f"Cannot start watching: {e}", "error")
-        if not silent and _active_app:
-            messagebox.showerror("Cannot start watching", str(e), parent=_active_app.root)
+        if not silent:
+            ui_queue.put(("popup", "Cannot start watching", str(e)))
         return False
 
 
 def stop_watching():
     global _observer, _watches, _is_watching
     if _is_watching and _observer:
-        try:
-            _observer.stop()
-            _observer.join(timeout=3)
-        except Exception:
-            pass
+        obs = _observer
         _observer = None
         _watches = {}
+        _is_watching = False
+        def _stop_bg():
+            try:
+                obs.stop()
+                obs.join(timeout=2.0)
+            except Exception:
+                pass
+        threading.Thread(target=_stop_bg, daemon=True).start()
     _is_watching = False
     log("Organizer stopped.", "info")
     if _tray:
         _tray.set_title(f"{APP_NAME} - stopped")
-    if _active_app:
-        _active_app.set_running_ui(False)
+    ui_queue.put(("running", False))
 
 
 def sort_now(silent=False):
@@ -2369,40 +2474,44 @@ def main():
             pass
 
     if not acquire_single_instance():
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showinfo(APP_NAME, "The organizer is already running.\nCheck your system tray (near the clock).")
-        root.destroy()
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showinfo(APP_NAME, "The organizer is already running.\nCheck your system tray (near the clock).")
+            root.destroy()
+        except Exception:
+            pass
         return
 
     lower_priority()
 
-    # Start system tray icon
+    # Start system tray icon (runs on background daemon thread)
     _tray = Tray()
     _tray.start()
 
-    # Auto start watching if configured or if launched minimized
-    if cfg.get("auto_start_watching", False) or minimized:
-        start_watching(silent=True)
+    # If minimized, auto-start watching in background thread if configured
+    if minimized and cfg.get("auto_start_watching", False):
+        threading.Thread(target=lambda: start_watching(silent=True), daemon=True).start()
 
     if not minimized or initial_folder:
-        _gui_cmd_queue.put(("open", initial_folder))
+        # Run GUI immediately on the main thread (zero delay, zero blocking)
+        run_gui_window(initial_folder=initial_folder)
     else:
         trim_working_set()
 
-    # Main thread event dispatch loop
+    # Main thread event dispatch loop (active only when GUI window is closed/hidden to tray)
     while _main_running:
         try:
             cmd, arg = _gui_cmd_queue.get(timeout=0.25)
             if cmd == "open" and _main_running:
                 run_gui_window(initial_folder=arg)
             elif cmd == "sort":
-                sort_now(silent=True)
+                threading.Thread(target=lambda: sort_now(silent=True), daemon=True).start()
             elif cmd == "toggle":
                 if _is_watching:
                     stop_watching()
                 else:
-                    start_watching(silent=True)
+                    threading.Thread(target=lambda: start_watching(silent=True), daemon=True).start()
             elif cmd == "quit":
                 break
         except queue.Empty:
